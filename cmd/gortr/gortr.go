@@ -100,6 +100,20 @@ var (
 		},
 		[]string{"path"},
 	)
+	LastChange = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "rpki_change",
+			Help: "Last change.",
+		},
+		[]string{"path"},
+	)
+	RefreshStatusCode = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "refresh_requests_total",
+			Help: "Total number of HTTP requests by status code",
+		},
+		[]string{"path", "code"},
+	)
 	ClientsMetric = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "rtr_clients",
@@ -124,11 +138,14 @@ var (
 		"password": METHOD_PASSWORD,
 		//"key":   METHOD_KEY,
 	}
+	urlToEtag = make(map[string]string)
 )
 
 func initMetrics() {
 	prometheus.MustRegister(NumberOfROAs)
+	prometheus.MustRegister(LastChange)
 	prometheus.MustRegister(LastRefresh)
+	prometheus.MustRegister(RefreshStatusCode)
 	prometheus.MustRegister(ClientsMetric)
 	prometheus.MustRegister(PDUsRecv)
 }
@@ -138,7 +155,7 @@ func metricHTTP() {
 	log.Fatal(http.ListenAndServe(*MetricsAddr, nil))
 }
 
-func fetchFile(file string, ua string) ([]byte, error) {
+func fetchFile(file string, ua string) ([]byte, bool, error) {
 	var f io.Reader
 	var err error
 	if len(file) > 8 && (file[0:7] == "http://" || file[0:8] == "https://") {
@@ -166,33 +183,54 @@ func fetchFile(file string, ua string) ([]byte, error) {
 		req.Header.Set("User-Agent", ua)
 		req.Header.Set("Accept", "text/json")
 
+		etag, ok := urlToEtag[file]
+		if ok {
+			req.Header.Set("If-None-Match", etag)
+		}
+
+
 		proxyurl, err := http.ProxyFromEnvironment(req)
 		if err != nil {
-			return nil, err
+			return nil, true, err
 		}
 		proxyreq := http.ProxyURL(proxyurl)
 		tr.Proxy = proxyreq
 
 		if err != nil {
-			return nil, err
+			return nil, true, err
 		}
 
 		fhttp, err := client.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, true, err
 		}
+
+		RefreshStatusCode.WithLabelValues(file, fmt.Sprintf("%d", fhttp.StatusCode)).Inc()
+
+		if fhttp.StatusCode == 304 {
+			return nil, false, nil
+		}
+
 		f = fhttp.Body
+
+		newEtag := fhttp.Header.Get("ETag")
+		if newEtag == "" {
+			delete(urlToEtag, file)
+		} else {
+			log.Debug(fmt.Sprintf("new etag: %s for %s", newEtag, file))
+			urlToEtag[file] = newEtag
+		}
 	} else {
 		f, err = os.Open(file)
 		if err != nil {
-			return nil, err
+			return nil, true, err
 		}
 	}
 	data, err2 := ioutil.ReadAll(f)
 	if err2 != nil {
-		return nil, err2
+		return nil, true, err2
 	}
-	return data, nil
+	return data, true, nil
 }
 
 func checkFile(data []byte) ([]byte, error) {
@@ -264,10 +302,16 @@ func (e IdenticalFile) Error() string {
 
 func (s *state) updateFile(file string) error {
 	log.Debugf("Refreshing cache from %v", file)
-	data, err := fetchFile(file, s.userAgent)
+
+	s.lastts = time.Now().UTC()
+	data, wasModified, err := fetchFile(file, s.userAgent)
 	if err != nil {
 		log.Error(err)
 		return err
+	}
+	LastRefresh.WithLabelValues(file).Set(float64(s.lastts.UnixNano() / 1e9))
+	if !wasModified {
+		return nil
 	}
 	hsum, _ := checkFile(data)
 	if s.lasthash != nil {
@@ -277,7 +321,7 @@ func (s *state) updateFile(file string) error {
 		}
 	}
 
-	s.lastts = time.Now().UTC()
+	s.lastchange = time.Now().UTC()
 	s.lastdata = data
 
 	roalistjson, err := decodeJSON(s.lastdata)
@@ -342,6 +386,7 @@ func (s *state) updateFile(file string) error {
 	if err != nil {
 		return err
 	}
+
 	log.Infof("New update (%v uniques, %v total prefixes). %v bytes. Updating sha256 hash %x -> %x",
 		len(roas), count, len(s.lastconverted), s.lasthash, hsum)
 	s.lasthash = hsum
@@ -366,17 +411,20 @@ func (s *state) updateFile(file string) error {
 				countv6_dup++
 			}
 		}
-		s.metricsEvent.UpdateMetrics(countv4, countv6, countv4_dup, countv6_dup, s.lastts, file)
+		s.metricsEvent.UpdateMetrics(countv4, countv6, countv4_dup, countv6_dup, s.lastchange, s.lastts, file)
 	}
 	return nil
 }
 
 func (s *state) updateSlurm(file string) error {
 	log.Debugf("Refreshing slurm from %v", file)
-	data, err := fetchFile(file, s.userAgent)
+	data, wasModified, err := fetchFile(file, s.userAgent)
 	if err != nil {
 		log.Error(err)
 		return err
+	}
+	if !wasModified {
+		return nil
 	}
 
 	buf := bytes.NewBuffer(data)
@@ -431,6 +479,7 @@ type state struct {
 	lastdata      []byte
 	lastconverted []byte
 	lasthash      []byte
+	lastchange    time.Time
 	lastts        time.Time
 	sendNotifs    bool
 	userAgent     string
@@ -471,12 +520,12 @@ func (m *metricsEvent) HandlePDU(c *rtr.Client, pdu rtr.PDU) {
 				"_", -1))).Inc()
 }
 
-func (m *metricsEvent) UpdateMetrics(numIPv4 int, numIPv6 int, numIPv4filtered int, numIPv6filtered int, refreshed time.Time, file string) {
+func (m *metricsEvent) UpdateMetrics(numIPv4 int, numIPv6 int, numIPv4filtered int, numIPv6filtered int, changed time.Time, refreshed time.Time, file string) {
 	NumberOfROAs.WithLabelValues("ipv4", "filtered", file).Set(float64(numIPv4filtered))
 	NumberOfROAs.WithLabelValues("ipv4", "unfiltered", file).Set(float64(numIPv4))
 	NumberOfROAs.WithLabelValues("ipv6", "filtered", file).Set(float64(numIPv6filtered))
 	NumberOfROAs.WithLabelValues("ipv6", "unfiltered", file).Set(float64(numIPv6))
-	LastRefresh.WithLabelValues(file).Set(float64(refreshed.UnixNano() / 1e9))
+	LastChange.WithLabelValues(file).Set(float64(changed.UnixNano() / 1e9))
 }
 
 func ReadPublicKey(key []byte, isPem bool) (*ecdsa.PublicKey, error) {
