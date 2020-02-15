@@ -154,10 +154,10 @@ func metricHTTP() {
 	log.Fatal(http.ListenAndServe(*MetricsAddr, nil))
 }
 
-func fetchFile(file string, etag string, ua string) ([]byte, string, error) {
-	var f io.Reader
+func (s *state) fetchFile(file string) ([]byte, bool, error) {
 	var err error
-	var newEtag string
+	var f io.Reader
+	var wasModified bool
 	if len(file) > 8 && (file[0:7] == "http://" || file[0:8] == "https://") {
 
 		// Copying base of DefaultTransport from https://golang.org/src/net/http/transport.go
@@ -176,57 +176,61 @@ func fetchFile(file string, etag string, ua string) ([]byte, string, error) {
 			ProxyConnectHeader:    map[string][]string{},
 		}
 		// Keep User-Agent in proxy request
-		tr.ProxyConnectHeader.Set("User-Agent", ua)
+		tr.ProxyConnectHeader.Set("User-Agent", s.userAgent)
 
 		client := &http.Client{Transport: tr}
 		req, err := http.NewRequest("GET", file, nil)
-		req.Header.Set("User-Agent", ua)
+		req.Header.Set("User-Agent", s.userAgent)
 		req.Header.Set("Accept", "text/json")
 
-		if etag != "" {
-			req.Header.Set("If-None-Match", etag)
+		if s.etags[file] != "" {
+			req.Header.Set("If-None-Match", s.etags[file])
 		}
-
 
 		proxyurl, err := http.ProxyFromEnvironment(req)
 		if err != nil {
-			return nil, "", err
+			return nil, false, err
 		}
 		proxyreq := http.ProxyURL(proxyurl)
 		tr.Proxy = proxyreq
 
 		if err != nil {
-			return nil, "", err
+			return nil, false, err
 		}
 
 		fhttp, err := client.Do(req)
 		if err != nil {
-			return nil, "", err
+			return nil, false, err
 		}
 
 		RefreshStatusCode.WithLabelValues(file, fmt.Sprintf("%d", fhttp.StatusCode)).Inc()
 
 		if fhttp.StatusCode == 304 {
-			return nil, etag, nil
+			return nil, false, nil
+		} else if fhttp.StatusCode != 200 {
+			delete(s.etags, file)
+			return nil, false, fmt.Errorf("HTTP %s", fhttp.Status)
 		}
 
 		f = fhttp.Body
 
-		newEtag = fhttp.Header.Get("ETag")
+		newEtag := fhttp.Header.Get("ETag")
 		if newEtag != "" {
-			log.Debug(fmt.Sprintf("new etag: %s for %s", newEtag, file))
+			wasModified = s.EtagWasUpdated(file, newEtag)
+		} else {
+			wasModified = true
 		}
 	} else {
 		f, err = os.Open(file)
 		if err != nil {
-			return nil, "", err
+			return nil, false, err
 		}
 	}
 	data, err2 := ioutil.ReadAll(f)
 	if err2 != nil {
-		return nil, "", err2
+		return nil, false, err2
 	}
-	return data, newEtag, nil
+	return data, wasModified, nil
 }
 
 func checkFile(data []byte) ([]byte, error) {
@@ -295,27 +299,27 @@ type IdenticalFile struct {
 func (e IdenticalFile) Error() string {
 	return fmt.Sprintf("File %v is identical to the previous version", e.File)
 }
-func (s *state) FileWasUpdated(file string, newEtag string) bool {
-	res := newEtag != "" && newEtag != s.etags[file]
-	if (res) {
-		log.Debugf("File was updated, Etag: '%s' -> '%s'", s.etags[file], newEtag)
-		s.etags[file] = newEtag
 
+func (s *state) EtagWasUpdated(file string, newEtag string) (updated bool) {
+	updated = newEtag != "" && newEtag != s.etags[file]
+	if updated {
+		log.Debugf("File was updated, Etag: '%s' -> '%s'", s.etags[file], newEtag)
 	}
-	return res
+	s.etags[file] = newEtag
+	return
 }
 
 func (s *state) updateFile(file string) error {
 	log.Debugf("Refreshing cache from %v", file)
 
 	s.lastts = time.Now().UTC()
-	data, newEtag, err := fetchFile(file, s.etags[file], s.userAgent)
+	data, wasModified, err := s.fetchFile(file)
 	if err != nil {
 		log.Error(err)
 		return err
 	}
 	LastRefresh.WithLabelValues(file).Set(float64(s.lastts.UnixNano() / 1e9))
-	if !s.FileWasUpdated(file, newEtag) {
+	if !wasModified {
 		return nil
 	}
 	hsum, _ := checkFile(data)
@@ -423,12 +427,12 @@ func (s *state) updateFile(file string) error {
 
 func (s *state) updateSlurm(file string) error {
 	log.Debugf("Refreshing slurm from %v", file)
-	data, newEtag, err := fetchFile(file, s.etags[file], s.userAgent)
+	data, wasModified, err := s.fetchFile(file)
 	if err != nil {
 		log.Error(err)
 		return err
 	}
-	if !s.FileWasUpdated(file, newEtag) {
+	if !wasModified {
 		return nil
 	}
 
