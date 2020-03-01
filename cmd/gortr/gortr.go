@@ -97,7 +97,7 @@ var (
 	LastRefresh = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "rpki_refresh",
-			Help: "Last refresh.",
+			Help: "Last successfull request for the given URL.",
 		},
 		[]string{"path"},
 	)
@@ -155,10 +155,9 @@ func metricHTTP() {
 	log.Fatal(http.ListenAndServe(*MetricsAddr, nil))
 }
 
-func (s *state) fetchFile(file string) ([]byte, bool, error) {
+func (s *state) fetchFile(file string) ([]byte, error) {
 	var f io.Reader
 	var err error
-	var wasModified bool
 	if len(file) > 8 && (file[0:7] == "http://" || file[0:8] == "https://") {
 
 		// Copying base of DefaultTransport from https://golang.org/src/net/http/transport.go
@@ -191,28 +190,32 @@ func (s *state) fetchFile(file string) ([]byte, bool, error) {
 
 		proxyurl, err := http.ProxyFromEnvironment(req)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		proxyreq := http.ProxyURL(proxyurl)
 		tr.Proxy = proxyreq
 
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 
 		fhttp, err := client.Do(req)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 
 		RefreshStatusCode.WithLabelValues(file, fmt.Sprintf("%d", fhttp.StatusCode)).Inc()
 
 		if fhttp.StatusCode == 304 {
-			return nil, false, nil
+			LastRefresh.WithLabelValues(file).Set(float64(s.lastts.UnixNano() / 1e9))
+			return nil, HttpNotModified{
+				File: file,
+			}
 		} else if fhttp.StatusCode != 200 {
 			delete(s.etags, file)
-			return nil, false, fmt.Errorf("HTTP %s", fhttp.Status)
+			return nil, fmt.Errorf("HTTP %s", fhttp.Status)
 		}
+		LastRefresh.WithLabelValues(file).Set(float64(s.lastts.UnixNano() / 1e9))
 
 		f = fhttp.Body
 
@@ -220,11 +223,8 @@ func (s *state) fetchFile(file string) ([]byte, bool, error) {
 
 		if !s.enableEtags || newEtag == "" || newEtag != s.etags[file] {
 			s.etags[file] = newEtag
-			wasModified = true
-		}
-
-		if !wasModified {
-			return nil, wasModified, IdenticalEtag{
+		} else {
+			return nil, IdenticalEtag{
 				File: file,
 				Etag: newEtag,
 			}
@@ -232,14 +232,14 @@ func (s *state) fetchFile(file string) ([]byte, bool, error) {
 	} else {
 		f, err = os.Open(file)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 	}
 	data, err := ioutil.ReadAll(f)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	return data, wasModified, nil
+	return data, nil
 }
 
 func checkFile(data []byte) ([]byte, error) {
@@ -309,6 +309,14 @@ func (e IdenticalFile) Error() string {
 	return fmt.Sprintf("File %s is identical to the previous version", e.File)
 }
 
+type HttpNotModified struct {
+	File string
+}
+
+func (e HttpNotModified) Error() string {
+	return fmt.Sprintf("HTTP 304 Not modified for %s", e.File)
+}
+
 type IdenticalEtag struct {
 	File string
 	Etag string
@@ -322,13 +330,9 @@ func (s *state) updateFile(file string) error {
 	log.Debugf("Refreshing cache from %s", file)
 
 	s.lastts = time.Now().UTC()
-	data, wasModified, err := s.fetchFile(file)
+	data, err := s.fetchFile(file)
 	if err != nil {
 		return err
-	}
-	LastRefresh.WithLabelValues(file).Set(float64(s.lastts.UnixNano() / 1e9))
-	if !wasModified {
-		return nil
 	}
 	hsum, _ := checkFile(data)
 	if s.lasthash != nil {
@@ -434,13 +438,9 @@ func (s *state) updateFile(file string) error {
 
 func (s *state) updateSlurm(file string) error {
 	log.Debugf("Refreshing slurm from %v", file)
-	data, wasModified, err := s.fetchFile(file)
+	data, err := s.fetchFile(file)
 	if err != nil {
-		log.Error(err)
 		return err
-	}
-	if !wasModified {
-		return nil
 	}
 
 	buf := bytes.NewBuffer(data)
@@ -468,12 +468,21 @@ func (s *state) routineUpdate(file string, interval int, slurmFile string) {
 		if slurmFile != "" {
 			err := s.updateSlurm(slurmFile)
 			if err != nil {
-				log.Errorf("Slurm: %v", err)
+				switch err.(type) {
+				case HttpNotModified:
+					log.Debug(err)
+				case IdenticalEtag:
+					log.Info(err)
+				default:
+					log.Errorf("Slurm: %v", err)
+				}
 			}
 		}
 		err := s.updateFile(file)
 		if err != nil {
 			switch err.(type) {
+			case HttpNotModified:
+				log.Debug(err)
 			case IdenticalEtag:
 				log.Info(err)
 			case IdenticalFile:
@@ -779,7 +788,14 @@ func main() {
 	if slurmFile != "" {
 		err := s.updateSlurm(slurmFile)
 		if err != nil {
-			log.Errorf("Slurm: %v", err)
+			switch err.(type) {
+			case HttpNotModified:
+				log.Debug(err)
+			case IdenticalEtag:
+				log.Info(err)
+			default:
+				log.Errorf("Slurm: %v", err)
+			}
 		}
 		if !*SlurmRefresh {
 			slurmFile = ""
@@ -789,6 +805,8 @@ func main() {
 	err := s.updateFile(*CacheBin)
 	if err != nil {
 		switch err.(type) {
+		case HttpNotModified:
+			log.Debug(err)
 		case IdenticalFile:
 			log.Info(err)
 		case IdenticalEtag:
