@@ -470,7 +470,7 @@ func (s *state) routineUpdate(file string, interval int, slurmFile string) {
 			if err != nil {
 				switch err.(type) {
 				case HttpNotModified:
-					log.Debug(err)
+					log.Info(err)
 				case IdenticalEtag:
 					log.Info(err)
 				default:
@@ -482,7 +482,7 @@ func (s *state) routineUpdate(file string, interval int, slurmFile string) {
 		if err != nil {
 			switch err.(type) {
 			case HttpNotModified:
-				log.Debug(err)
+				log.Info(err)
 			case IdenticalEtag:
 				log.Info(err)
 			case IdenticalFile:
@@ -790,7 +790,7 @@ func main() {
 		if err != nil {
 			switch err.(type) {
 			case HttpNotModified:
-				log.Debug(err)
+				log.Info(err)
 			case IdenticalEtag:
 				log.Info(err)
 			default:
@@ -806,7 +806,7 @@ func main() {
 	if err != nil {
 		switch err.(type) {
 		case HttpNotModified:
-			log.Debug(err)
+			log.Info(err)
 		case IdenticalFile:
 			log.Info(err)
 		case IdenticalEtag:
